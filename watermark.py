@@ -12,19 +12,21 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import hashlib
+import io
 import os
-import re
 import sys
+import tokenize
 
 # ---------------------------------------------------------------------------
 # Steganographic layer
 #
 # Uses Unicode Tag characters (Supplementary Special-purpose Plane, U+E0000).
 # These are invisible in all editors, terminals, and browsers.
-# The payload is split across multiple injection points throughout the file
-# rather than injected as a single consecutive block.
+# The payload is spread across multiple injection points found via tokenize,
+# so it always lands INSIDE strings or comments — never in expressions.
 #
 #   U+E0020  Tag Space        → bit 0
 #   U+E0021  Tag !            → bit 1
@@ -35,8 +37,6 @@ _T0 = "\U000e0020"
 _T1 = "\U000e0021"
 _TD = "\U000e0001"
 
-_STRING_OR_COMMENT = re.compile(r'("""|\'\'\')|(\"|\')|(#[^\n]*)')
-
 
 def _encode_payload(message: str) -> str:
     bits = "".join(format(ord(c), "08b") for c in message)
@@ -45,17 +45,13 @@ def _encode_payload(message: str) -> str:
 
 
 def _decode_payload(text: str) -> str | None:
-    # Collect all tag chars across the whole file, in order
     all_chars = [c for c in text if c in (_T0, _T1, _TD)]
     if not all_chars:
         return None
-    joined = "".join(all_chars)
-    # Payload is between the first pair of delimiters
-    parts = joined.split(_TD)
+    parts = "".join(all_chars).split(_TD)
     if len(parts) < 3:
         return None
-    body = parts[1]
-    bits = "".join("0" if c == _T0 else "1" for c in body)
+    bits = "".join("0" if c == _T0 else "1" for c in parts[1])
     if not bits or len(bits) % 8 != 0:
         return None
     try:
@@ -64,29 +60,76 @@ def _decode_payload(text: str) -> str | None:
         return None
 
 
-def _pick_injection_points(matches: list, n: int) -> list:
-    """Pick n evenly spaced matches from across the file."""
-    if len(matches) <= n:
-        return matches
-    step = (len(matches) - 1) / (n - 1) if n > 1 else 0
-    return [matches[round(i * step)] for i in range(n)]
+def _line_starts(source: str) -> list[int]:
+    """Cumulative character offsets for each line (1-indexed: index 0 unused)."""
+    starts = [0, 0]  # pad so starts[row] works with 1-based row numbers
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
+def _injection_points(source: str) -> list[int]:
+    """Return char offsets that are safe to inject into.
+
+    Only uses:
+      - Module / class / function docstrings  (found via AST)
+      - Single-line comments                  (found via tokenize)
+
+    Regular string literals used as values are intentionally excluded —
+    injecting into them would corrupt glob patterns, dict keys, etc.
+    """
+    ls = _line_starts(source)
+    points: list[int] = []
+
+    # 1. Docstrings via AST (triple-quoted opening only)
+    try:
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                     ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if not (node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)):
+                continue
+            doc = node.body[0].value
+            abs_start = ls[doc.lineno] + doc.col_offset
+            if source[abs_start : abs_start + 3] in ('"""', "'''"):
+                points.append(abs_start + 3)   # right inside the opening """
+    except SyntaxError:
+        pass
+
+    # 2. Single-line comments via tokenize
+    try:
+        for tok_type, _, (row, col), _, _ in tokenize.generate_tokens(
+            io.StringIO(source).readline
+        ):
+            if tok_type == tokenize.COMMENT:
+                points.append(ls[row] + col + 1)  # right after '#'
+    except tokenize.TokenError:
+        pass
+
+    return sorted(set(points))
 
 
 def embed(source: str, message: str) -> str:
     """Inject a steganographic watermark spread across multiple locations."""
     payload = _encode_payload(message)
-    matches = list(_STRING_OR_COMMENT.finditer(source))
+    points = _injection_points(source)
 
-    if not matches:
+    if not points:
         return f'"""{payload}"""\n' + source
 
-    chosen = _pick_injection_points(matches, n=3)
+    n = min(3, len(points))
+    chosen = (
+        [points[round(i * (len(points) - 1) / (n - 1))] for i in range(n)]
+        if n > 1 else [points[0]]
+    )
+    # Inject in reverse so earlier offsets stay valid
     result = source
-    offset = 0
-    for match in chosen:
-        pos = match.end() + offset
+    for pos in reversed(chosen):
         result = result[:pos] + payload + result[pos:]
-        offset += len(payload)
     return result
 
 
