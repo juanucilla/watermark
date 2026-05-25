@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv
+venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+example_marked.py
+beacon_stealth.py
